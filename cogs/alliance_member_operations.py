@@ -680,6 +680,39 @@ class AllianceMemberOperations(commands.Cog):
                         )
 
             @discord.ui.button(
+                label="Bulk Assign",
+                emoji="🧭",
+                style=discord.ButtonStyle.primary,
+                custom_id="assign_members",
+                row=1
+            )
+            async def bulk_assign_button(self, button_interaction: discord.Interaction, button: discord.ui.Button):
+                """Prompt the admin to paste a list of IDs, then ask for the target alliance and assign existing users to it."""
+                try:
+                    # permission check
+                    with sqlite3.connect('db/settings.sqlite') as settings_db:
+                        cursor = settings_db.cursor()
+                        cursor.execute("SELECT is_initial FROM admin WHERE id = ?", (button_interaction.user.id,))
+                        admin_result = cursor.fetchone()
+                        if not admin_result:
+                            await button_interaction.response.send_message(
+                                "❌ You do not have permission to use this command.",
+                                ephemeral=True
+                            )
+                            return
+
+                    # Ask for IDs via a modal
+                    modal = AssignMembersModal()
+                    await button_interaction.response.send_modal(modal)
+
+                except Exception as e:
+                    self.log_message(f"Error in bulk_assign_button: {e}")
+                    await button_interaction.response.send_message(
+                        "❌ An error occurred while starting bulk assign.",
+                        ephemeral=True
+                    )
+
+            @discord.ui.button(
                 label="Main Menu", 
                 emoji="🏠", 
                 style=discord.ButtonStyle.secondary,
@@ -1459,6 +1492,100 @@ class AllianceMemberOperations(commands.Cog):
                     ephemeral=True
                 )
 
+    async def prompt_assign_target(self, interaction: discord.Interaction, ids: str):
+        """Show alliance selection for bulk assign and apply assignment to existing users."""
+        try:
+            # Build list of alliances the user can target
+            alliances, special_alliances, is_global = await self.get_admin_alliances(interaction.user.id, getattr(interaction, 'guild_id', None))
+            if not alliances:
+                await interaction.response.send_message("❌ No alliances available.", ephemeral=True)
+                return
+
+            alliances_with_counts = []
+            for alliance_id, name in alliances:
+                with sqlite3.connect('db/users.sqlite') as users_db:
+                    cursor = users_db.cursor()
+                    cursor.execute("SELECT COUNT(*) FROM users WHERE alliance = ?", (alliance_id,))
+                    member_count = cursor.fetchone()[0]
+                    alliances_with_counts.append((alliance_id, name, member_count))
+
+            select_embed = discord.Embed(
+                title="🎯 Target Alliance for Bulk Assign",
+                description=("Select the destination alliance to assign the provided IDs to."),
+                color=discord.Color.blue()
+            )
+
+            # create a simple select with all alliances
+            options = [discord.SelectOption(label=f"{name[:50]}", value=str(alliance_id), description=f"ID: {alliance_id} | Members: {count}") for alliance_id, name, count in alliances_with_counts]
+            select = discord.ui.Select(placeholder="🎯 Choose target alliance...", options=options)
+            view = discord.ui.View()
+            view.add_item(select)
+
+            async def select_cb(select_interaction: discord.Interaction):
+                target_alliance_id = int(select.values[0])
+                # perform assignment: update users that exist with the given fids
+                # parse ids
+                if '\n' in ids:
+                    fid_list = [s.strip() for s in ids.split('\n') if s.strip()]
+                else:
+                    fid_list = [s.strip() for s in ids.replace(' ', '').split(',') if s.strip()]
+
+                updated = []
+                not_found = []
+                try:
+                    with sqlite3.connect('db/users.sqlite') as users_db:
+                        cursor = users_db.cursor()
+                        for fid in fid_list:
+                            cursor.execute("SELECT fid FROM users WHERE fid = ?", (fid,))
+                            if cursor.fetchone():
+                                cursor.execute("UPDATE users SET alliance = ? WHERE fid = ?", (target_alliance_id, fid))
+                                updated.append(fid)
+                            else:
+                                not_found.append(fid)
+                        users_db.commit()
+
+                    with sqlite3.connect('db/alliance.sqlite') as alliance_db:
+                        cursor = alliance_db.cursor()
+                        cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (target_alliance_id,))
+                        target_name_row = cursor.fetchone()
+                        target_name = target_name_row[0] if target_name_row else str(target_alliance_id)
+
+                    result_embed = discord.Embed(
+                        title="✅ Bulk Assign Completed",
+                        description=(
+                            f"**Target Alliance:** {target_name} (`{target_alliance_id}`)\n"
+                            f"✅ Assigned: `{len(updated)}`\n"
+                            f"❌ Not found (not in DB): `{len(not_found)}`\n"
+                        ),
+                        color=discord.Color.green()
+                    )
+                    if updated:
+                        result_embed.add_field(name="Assigned IDs", value=", ".join(updated[:100]) if len(updated) <= 100 else ", ".join(updated[:100]) + ", ...", inline=False)
+                    if not_found:
+                        result_embed.add_field(name="Not found IDs", value=", ".join(not_found[:100]) if len(not_found) <= 100 else ", ".join(not_found[:100]) + ", ...", inline=False)
+
+                    await select_interaction.response.edit_message(embed=result_embed, view=None)
+
+                except Exception as e:
+                    self.log_message(f"Bulk assign error: {e}")
+                    await select_interaction.response.edit_message(embed=discord.Embed(title="❌ Error", description="An error occurred during bulk assign.", color=discord.Color.red()), view=None)
+
+            select.callback = select_cb
+
+            # if this was invoked via a modal submit, interaction.response may not be used yet
+            try:
+                await interaction.response.send_message(embed=select_embed, view=view, ephemeral=True)
+            except Exception:
+                # fallback to followup
+                await interaction.followup.send(embed=select_embed, view=view, ephemeral=True)
+
+        except Exception as e:
+            self.log_message(f"Error in prompt_assign_target: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Error preparing target selection.", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Error preparing target selection.", ephemeral=True)
+
 class AddMemberModal(discord.ui.Modal):
     def __init__(self, alliance_id):
         super().__init__(title="Add Member")
@@ -1481,6 +1608,31 @@ class AddMemberModal(discord.ui.Modal):
             print(f"ERROR: Modal submit error - {str(e)}")
             await interaction.response.send_message(
                 "An error occurred. Please try again.", 
+                ephemeral=True
+            )
+
+class AssignMembersModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="Bulk Assign Members")
+        self.add_item(discord.ui.TextInput(
+            label="Enter IDs (comma or newline separated)",
+            placeholder="12345,67890,54321 or one ID per line",
+            style=discord.TextStyle.paragraph
+        ))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            ids = self.children[0].value
+            # delegate to cog to prompt for target alliance
+            cog = interaction.client.get_cog("AllianceMemberOperations")
+            if cog:
+                await cog.prompt_assign_target(interaction, ids)
+            else:
+                await interaction.response.send_message("❌ Internal error: cog not available.", ephemeral=True)
+        except Exception as e:
+            print(f"ERROR: Assign modal submit error - {str(e)}")
+            await interaction.response.send_message(
+                "An error occurred. Please try again.",
                 ephemeral=True
             )
 
