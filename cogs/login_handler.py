@@ -6,6 +6,7 @@ import ssl
 import os
 from datetime import datetime
 from typing import Optional, List, Dict, Callable
+from .proxy_manager import ProxyPool
 
 class LoginHandler:
     """
@@ -57,6 +58,15 @@ class LoginHandler:
         if not os.path.exists(self.log_directory):
             os.makedirs(self.log_directory)
         self.log_file = os.path.join(self.log_directory, 'login_handler.txt')
+
+        # Proxy pool and parallelism settings
+        # Enable proxy parallel mode with environment variable USE_PROXY=1
+        self.proxy_enabled = os.getenv('USE_PROXY', '0') == '1'
+        self.max_concurrency = int(os.getenv('PROXY_CONCURRENCY', '4'))
+        try:
+            self.proxy_pool = ProxyPool()
+        except Exception:
+            self.proxy_pool = None
         
         # Mark as initialized
         self._initialized = True
@@ -274,12 +284,60 @@ class LoginHandler:
         """
         total = len(fids)
         
-        # Use alliance lock if provided
+        # If proxy-enabled and pool available, use parallel fetching
+        if self.proxy_enabled and self.proxy_pool:
+            if alliance_id:
+                async with self.get_alliance_lock(alliance_id):
+                    return await self.fetch_player_batch_parallel(fids, progress_callback)
+            else:
+                return await self.fetch_player_batch_parallel(fids, progress_callback)
+
+        # Use alliance lock if provided for sequential path
         if alliance_id:
             async with self.get_alliance_lock(alliance_id):
                 return await self._fetch_batch_internal(fids, progress_callback, total)
         else:
             return await self._fetch_batch_internal(fids, progress_callback, total)
+
+    async def fetch_player_batch_parallel(self, fids: List[str], progress_callback: Optional[Callable] = None) -> List[Dict]:
+        """Fetch multiple players in parallel using proxies from ProxyPool.
+
+        Each worker acquires a proxy and calls fetch_player_data with that proxy.
+        Concurrency is limited by self.max_concurrency.
+        """
+        results = [None] * len(fids)
+
+        semaphore = asyncio.Semaphore(self.max_concurrency)
+
+        async def worker(idx: int, fid: str):
+            async with semaphore:
+                if progress_callback:
+                    await progress_callback(idx + 1, len(fids), f"Starting {idx + 1}/{len(fids)}")
+
+                proxy = None
+                try:
+                    # Acquire a proxy if pool available
+                    if self.proxy_pool:
+                        proxy = await self.proxy_pool.acquire()
+                except Exception as e:
+                    self.log_message(f"Proxy acquire failed: {e}")
+                    proxy = None
+
+                # Call fetch_player_data with proxy if available
+                result = await self.fetch_player_data(fid, use_proxy=proxy if proxy else None)
+
+                if progress_callback:
+                    await progress_callback(idx + 1, len(fids), f"Completed {idx + 1}/{len(fids)}")
+
+                results[idx] = result
+
+        # Launch tasks
+        tasks = [asyncio.create_task(worker(i, fid)) for i, fid in enumerate(fids)]
+
+        # Wait for all
+        await asyncio.gather(*tasks)
+
+        return results
     
     async def _fetch_batch_internal(self, fids: List[str], progress_callback: Optional[Callable], 
                                   total: int) -> List[Dict]:
