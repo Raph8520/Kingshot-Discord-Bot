@@ -4,6 +4,7 @@ from discord.ext import commands
 import sqlite3  
 import asyncio
 from datetime import datetime
+import re
 
 class Alliance(commands.Cog):
     def __init__(self, bot, conn):
@@ -96,12 +97,170 @@ class Alliance(commands.Cog):
                 color=discord.Color.blue()
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
-
         except Exception as e:
             await interaction.response.send_message(
                 "An error occurred while fetching alliances.", 
                 ephemeral=True
             )
+
+    @app_commands.command(name="transfer", description="Transfer multiple members from one alliance to another using a pasted list of PIDs.")
+    async def transfer(self, interaction: discord.Interaction, source: int, target: int, pids: str):
+        """Transfer multiple players (by fid/pid) from source alliance to target alliance.
+
+        Usage: /alliance transfer <source> <target> <pid(s)>
+        The pids field may contain a space/comma/newline separated list; non-digits are ignored.
+        """
+        try:
+            # Permission check
+            if interaction.guild is None:
+                await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+                return
+
+            user_id = interaction.user.id
+            self.c_settings.execute("SELECT id, is_initial FROM admin WHERE id = ?", (user_id,))
+            admin = self.c_settings.fetchone()
+            if admin is None:
+                await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+                return
+
+            # validate source and target alliances exist
+            self.c.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (source,))
+            row = self.c.fetchone()
+            if not row:
+                await interaction.response.send_message(f"❌ Source alliance id `{source}` not found.", ephemeral=True)
+                return
+            source_name = row[0]
+
+            self.c.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (target,))
+            row = self.c.fetchone()
+            if not row:
+                await interaction.response.send_message(f"❌ Target alliance id `{target}` not found.", ephemeral=True)
+                return
+            target_name = row[0]
+
+            # parse pids - extract all integers
+            found_pids = re.findall(r"\d+", pids)
+            if not found_pids:
+                await interaction.response.send_message("❌ No valid player IDs found in the provided list.", ephemeral=True)
+                return
+
+            # Deduplicate and prepare
+            unique_pids = []
+            seen = set()
+            for pid in found_pids:
+                if pid not in seen:
+                    seen.add(pid)
+                    unique_pids.append(int(pid))
+
+            # Look up which PIDs exist and which belong to the source alliance
+            to_transfer = []
+            not_found = []
+            wrong_source = []
+
+            with sqlite3.connect('db/users.sqlite') as users_db:
+                cursor = users_db.cursor()
+                for fid in unique_pids:
+                    cursor.execute("SELECT nickname, alliance FROM users WHERE fid = ?", (fid,))
+                    r = cursor.fetchone()
+                    if not r:
+                        not_found.append(fid)
+                        continue
+                    nickname, current_alliance = r
+                    if current_alliance != source:
+                        wrong_source.append((fid, current_alliance))
+                        continue
+                    to_transfer.append((fid, nickname))
+
+            # Build confirmation embed
+            confirm_embed = discord.Embed(
+                title="🔄 Alliance Bulk Transfer - Confirmation",
+                description=(
+                    f"You are about to transfer **{len(to_transfer)}** member(s) from **{source_name}** (`{source}`) to **{target_name}** (`{target}`).\n\n"
+                    f"Found: `{len(unique_pids)}` IDs provided.\n"
+                    f"Will transfer: `{len(to_transfer)}`.\n"
+                    f"Not found: `{len(not_found)}`.\n"
+                    f"Wrong source (present but not in `{source}`): `{len(wrong_source)}`.\n\n"
+                    "Click Confirm to perform the transfer, or Cancel to abort."
+                ),
+                color=discord.Color.orange()
+            )
+
+            # preview up to first 30 IDs
+            preview_lines = []
+            for fid, nick in to_transfer[:30]:
+                preview_lines.append(f"{fid} - {nick}")
+            if preview_lines:
+                confirm_embed.add_field(name="Preview (first 30)", value="\n".join(preview_lines), inline=False)
+
+            view = discord.ui.View(timeout=120)
+
+            confirm_btn = discord.ui.Button(label="✅ Confirm", style=discord.ButtonStyle.danger)
+            cancel_btn = discord.ui.Button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+
+            async def on_confirm(i: discord.Interaction):
+                if i.user.id != interaction.user.id:
+                    await i.response.send_message("You cannot confirm this action.", ephemeral=True)
+                    return
+
+                # perform transfers
+                transferred = []
+                errors = []
+                try:
+                    with sqlite3.connect('db/users.sqlite') as users_db:
+                        cursor = users_db.cursor()
+                        for fid, nick in to_transfer:
+                            try:
+                                cursor.execute("UPDATE users SET alliance = ? WHERE fid = ?", (target, fid))
+                                transferred.append(fid)
+                            except Exception as ex:
+                                errors.append((fid, str(ex)))
+                        users_db.commit()
+                except Exception as ex:
+                    await i.response.send_message(f"❌ Failed to perform transfers: {ex}", ephemeral=True)
+                    return
+
+                result_embed = discord.Embed(
+                    title="✅ Transfer Complete",
+                    description=(
+                        f"Transferred: `{len(transferred)}` members from **{source_name}** to **{target_name}**.\n"
+                        f"Not found: `{len(not_found)}`.\n"
+                        f"Wrong source: `{len(wrong_source)}`.\n"
+                        f"Errors: `{len(errors)}`."
+                    ),
+                    color=discord.Color.green()
+                )
+
+                if not_found:
+                    result_embed.add_field(name="Not found (first 20)", value=", ".join(str(x) for x in not_found[:20]), inline=False)
+                if wrong_source:
+                    result_embed.add_field(name="Wrong source (first 20)", value=", ".join(f"{fid} (in {cur})" for fid, cur in wrong_source[:20]), inline=False)
+                if errors:
+                    result_embed.add_field(name="Errors (first 10)", value="\n".join(f"{fid}: {msg}" for fid, msg in errors[:10]), inline=False)
+
+                await i.response.edit_message(embed=result_embed, view=None)
+
+            async def on_cancel(i: discord.Interaction):
+                if i.user.id != interaction.user.id:
+                    await i.response.send_message("You cannot cancel this action.", ephemeral=True)
+                    return
+                await i.response.edit_message(content="Operation cancelled.", embed=None, view=None)
+
+            confirm_btn.callback = on_confirm
+            cancel_btn.callback = on_cancel
+            view.add_item(confirm_btn)
+            view.add_item(cancel_btn)
+
+            await interaction.response.send_message(embed=confirm_embed, view=view, ephemeral=True)
+
+        except Exception as e:
+            print(f"Transfer command error: {e}")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("An error occurred while processing the transfer.", ephemeral=True)
+                else:
+                    await interaction.followup.send("An error occurred while processing the transfer.", ephemeral=True)
+            except Exception:
+                pass
 
     @app_commands.command(name="settings", description="Open settings menu.")
     async def settings(self, interaction: discord.Interaction):
@@ -577,7 +736,46 @@ class Alliance(commands.Cog):
                     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
                 elif custom_id == "member_operations":
-                    await self.bot.get_cog("AllianceMemberOperations").handle_member_operations(interaction)
+                    try:
+                        await self.bot.get_cog("AllianceMemberOperations").handle_member_operations(interaction)
+                    except Exception as e:
+                        # Ensure we log the full traceback to a file for debugging
+                        import traceback, os
+                        log_dir = os.path.join(os.getcwd(), 'log')
+                        try:
+                            if not os.path.exists(log_dir):
+                                os.makedirs(log_dir)
+                        except Exception:
+                            pass
+                        log_path = os.path.join(log_dir, 'alliance_errors.txt')
+                        try:
+                            with open(log_path, 'a', encoding='utf-8') as lf:
+                                lf.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Error in member_operations handler:\n")
+                                lf.write(''.join(traceback.format_exception(type(e), e, e.__traceback__)))
+                                lf.write('\n')
+                        except Exception:
+                            # Best-effort logging only
+                            print('Failed to write to alliance_errors.txt')
+
+                        # Also print to console so the running process can capture it
+                        print(f"Error in member_operations: {e}")
+                        print(''.join(traceback.format_exception(type(e), e, e.__traceback__)))
+
+                        # Inform the user with a generic message
+                        try:
+                            if not interaction.response.is_done():
+                                await interaction.response.send_message(
+                                    "An error occurred while processing your request. The error has been logged.",
+                                    ephemeral=True
+                                )
+                            else:
+                                await interaction.followup.send(
+                                    "An error occurred while processing your request. The error has been logged.",
+                                    ephemeral=True
+                                )
+                        except Exception:
+                            # If sending the message fails, just ignore to avoid cascading errors
+                            pass
 
                 elif custom_id == "bot_operations":
                     try:

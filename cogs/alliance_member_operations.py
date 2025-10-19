@@ -917,7 +917,33 @@ class AllianceMemberOperations(commands.Cog):
                     )
 
         view = MemberOperationsView(self)
-        await interaction.response.edit_message(embed=embed, view=view)
+        try:
+            await interaction.response.edit_message(embed=embed, view=view)
+        except Exception as e:
+            # Handle Unknown interaction (404 / 10062) or other HTTP errors by logging and falling back
+            try:
+                from discord import NotFound, HTTPException
+                import traceback
+                # write to cog log file
+                try:
+                    with open(os.path.join(self.log_directory, 'alliance_member_errors.txt'), 'a', encoding='utf-8') as lf:
+                        lf.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Error editing interaction message: {e}\n")
+                        lf.write(''.join(traceback.format_exception(type(e), e, e.__traceback__)))
+                        lf.write('\n')
+                except Exception:
+                    print('Failed to write alliance_member_errors.txt')
+
+                # If interaction already responded or is unknown, try followup
+                if hasattr(interaction, 'followup') and not interaction.response.is_done():
+                    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+                else:
+                    # Try to send in channel directly as a fallback
+                    channel = interaction.channel or (interaction.message.channel if hasattr(interaction, 'message') and interaction.message else None)
+                    if channel:
+                        await channel.send(embed=embed, view=view)
+            except Exception:
+                # Last-resort: print the error to console
+                print(f"Fallback send for member operations failed: {e}")
 
     async def add_user(self, interaction: discord.Interaction, alliance_id: str, ids: str):
         self.c_alliance.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (alliance_id,))
