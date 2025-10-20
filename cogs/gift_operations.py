@@ -785,9 +785,59 @@ class GiftOperations(commands.Cog):
         except Exception as e:
             self.logger.exception(f"GiftOps: Error in batch_process_alliance_results: {e}")
 
-    def get_stove_info_wos(self, player_id):
-        session = requests.Session()
-        session.mount("https://", HTTPAdapter(max_retries=self.retry_config))
+    async def get_stove_info_wos(self, player_id, proxy: str | None = None, max_retries: int = 3):
+        """Async version: fetch player info using aiohttp. Returns (status_code, json_or_text).
+        If proxy is provided, a ProxyConnector will be used.
+        """
+        import aiohttp
+        try:
+            # Build connector (proxy or plain)
+            if proxy:
+                try:
+                    from aiohttp_socks import ProxyConnector
+                    connector = ProxyConnector.from_url(proxy, ssl=False)
+                except Exception:
+                    connector = aiohttp.TCPConnector(ssl=False)
+            else:
+                connector = aiohttp.TCPConnector(ssl=False)
+
+            headers = {
+                "accept": "application/json, text/plain, */*",
+                "content-type": "application/x-www-form-urlencoded",
+                "origin": self.wos_giftcode_redemption_url,
+            }
+
+            data_to_encode = {
+                "fid": f"{player_id}",
+                "time": f"{int(datetime.now().timestamp())}",
+            }
+            payload = self.encode_data(data_to_encode)
+
+            attempt = 0
+            while attempt < max_retries:
+                attempt += 1
+                try:
+                    async with aiohttp.ClientSession(connector=connector) as session:
+                        async with session.post(self.wos_player_info_url, headers=headers, data=payload, timeout=15) as resp:
+                            text = await resp.text()
+                            try:
+                                js = await resp.json()
+                                return resp.status, js
+                            except Exception:
+                                return resp.status, text
+                except Exception as e:
+                    self.logger.debug(f"get_stove_info_wos attempt {attempt} failed: {e}")
+                    await asyncio.sleep(min(2 ** attempt, 8))
+
+            return 500, {}
+        except Exception as e:
+            self.logger.exception(f"get_stove_info_wos fatal error: {e}")
+            return 500, {}
+
+    async def attempt_gift_code_with_api(self, player_id, giftcode, proxy: str | None = None, max_retries: int = 3):
+        """Async attempt to redeem a gift code using aiohttp. Returns status string."""
+        import aiohttp
+        self.logger.info(f"GiftOps: Attempting gift code redemption for ID {player_id} (async, proxy={bool(proxy)})")
 
         headers = {
             "accept": "application/json, text/plain, */*",
@@ -797,81 +847,92 @@ class GiftOperations(commands.Cog):
 
         data_to_encode = {
             "fid": f"{player_id}",
-            "time": f"{int(datetime.now().timestamp())}",
-        }
-        data = self.encode_data(data_to_encode)
-        
-        response_stove_info = session.post(
-            self.wos_player_info_url,
-            headers=headers,
-            data=data,
-        )
-        return session, response_stove_info
-
-    async def attempt_gift_code_with_api(self, player_id, giftcode, session):
-        """Attempt to redeem a gift code directly without captcha (Kingshot version)."""
-        self.logger.info(f"GiftOps: Attempting gift code redemption for ID {player_id} (no captcha required)")
-        
-        # Submit gift code directly without captcha
-        data_to_encode = {
-            "fid": f"{player_id}",
             "cdk": giftcode,
             "time": f"{int(datetime.now().timestamp()*1000)}"
         }
-        data = self.encode_data(data_to_encode)
-        
-        # Submit to gift code API
-        response_giftcode = session.post(self.wos_giftcode_url, data=data)
-        
-        # Log the redemption attempt
-        log_entry_redeem = f"\n{datetime.now()} API REQ - Gift Code Redeem\nID:{player_id}, Code:{giftcode}\n"
-        try:
-            response_json_redeem = response_giftcode.json()
-            log_entry_redeem += f"Resp Code: {response_giftcode.status_code}\nResponse JSON:\n{json.dumps(response_json_redeem, indent=2)}\n"
-        except json.JSONDecodeError:
-            response_json_redeem = {}
-            log_entry_redeem += f"Resp Code: {response_giftcode.status_code}\nResponse Text (Not JSON): {response_giftcode.text[:500]}...\n"
-        log_entry_redeem += "-" * 50 + "\n"
-        self.giftlog.info(log_entry_redeem.strip())
-        
-        # Parse response
-        msg = response_json_redeem.get("msg", "Unknown Error").strip('.')
-        err_code = response_json_redeem.get("err_code")
-        
-        # Determine final status
-        if msg == "SUCCESS":
-            status = "SUCCESS"
-        elif msg == "RECEIVED" and err_code == 40008:
-            status = "RECEIVED"
-        elif msg == "SAME TYPE EXCHANGE" and err_code == 40011:
-            status = "SAME TYPE EXCHANGE"
-        elif msg == "TIME ERROR" and err_code == 40007:
-            status = "TIME_ERROR"
-        elif msg == "CDK NOT FOUND" and err_code == 40014:
-            status = "CDK_NOT_FOUND"
-        elif msg == "USED" and err_code == 40005:
-            status = "USAGE_LIMIT"
-        elif msg == "TIMEOUT RETRY" and err_code == 40004:
-            status = "TIMEOUT_RETRY"
-        elif msg == "NOT LOGIN":
-            status = "LOGIN_EXPIRED_MID_PROCESS"
-        elif "sign error" in msg.lower():
-            status = "SIGN_ERROR"
-            self.logger.error(f"[SIGN ERROR] Sign error detected for ID {player_id}, code {giftcode}")
-            self.logger.error(f"[SIGN ERROR] Response: {response_json_redeem}")
-        elif msg == "STOVE_LV ERROR" and err_code == 40006:
-            status = "TOO_SMALL_SPEND_MORE"
-            self.logger.error(f"[FURNACE LVL ERROR] Furnace level is too low for ID {player_id}, code {giftcode}")
-            self.logger.error(f"[FURNACE LVL ERROR] Response: {response_json_redeem}")
-        elif msg == "RECHARGE_MONEY ERROR" and err_code == 40017:
-            status = "TOO_POOR_SPEND_MORE"
-            self.logger.error(f"[VIP LEVEL ERROR] VIP level is too low for ID {player_id}, code {giftcode}")
-            self.logger.error(f"[VIP LEVEL ERROR] Response: {response_json_redeem}")
+        payload = self.encode_data(data_to_encode)
+
+        # Build connector
+        if proxy:
+            try:
+                from aiohttp_socks import ProxyConnector
+                connector = ProxyConnector.from_url(proxy, ssl=False)
+            except Exception:
+                connector = aiohttp.TCPConnector(ssl=False)
         else:
-            status = "UNKNOWN_API_RESPONSE"
-            self.logger.info(f"Unknown API response for {player_id}: msg='{msg}', err_code={err_code}")
-        
-        return status, None, None, None
+            connector = aiohttp.TCPConnector(ssl=False)
+
+        attempt = 0
+        last_resp_json = {}
+        while attempt < max_retries:
+            attempt += 1
+            try:
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    async with session.post(self.wos_giftcode_url, data=payload, headers=headers, timeout=20) as resp:
+                        text = await resp.text()
+                        try:
+                            resp_json = await resp.json()
+                        except Exception:
+                            resp_json = {}
+
+                        # Log
+                        log_entry_redeem = f"\n{datetime.now()} API REQ - Gift Code Redeem\nID:{player_id}, Code:{giftcode}\n"
+                        try:
+                            log_entry_redeem += f"Resp Code: {resp.status}\nResponse JSON:\n{json.dumps(resp_json, indent=2)}\n"
+                        except Exception:
+                            log_entry_redeem += f"Resp Code: {resp.status}\nResponse Text (Not JSON): {text[:500]}...\n"
+                        log_entry_redeem += "-" * 50 + "\n"
+                        self.giftlog.info(log_entry_redeem.strip())
+
+                        msg = resp_json.get("msg", str(text)).strip('.') if isinstance(resp_json, dict) else str(text)
+                        err_code = resp_json.get("err_code") if isinstance(resp_json, dict) else None
+
+                        # Map responses
+                        if msg == "SUCCESS":
+                            return "SUCCESS", resp_json
+                        if msg == "RECEIVED" and err_code == 40008:
+                            return "RECEIVED", resp_json
+                        if msg == "SAME TYPE EXCHANGE" and err_code == 40011:
+                            return "SAME TYPE EXCHANGE", resp_json
+                        if msg == "TIME ERROR" and err_code == 40007:
+                            return "TIME_ERROR", resp_json
+                        if msg == "CDK NOT FOUND" and err_code == 40014:
+                            return "CDK_NOT_FOUND", resp_json
+                        if msg == "USED" and err_code == 40005:
+                            return "USAGE_LIMIT", resp_json
+                        if msg == "TIMEOUT RETRY" and err_code == 40004:
+                            return "TIMEOUT_RETRY", resp_json
+                        if msg == "NOT LOGIN":
+                            return "LOGIN_EXPIRED_MID_PROCESS", resp_json
+                        if isinstance(msg, str) and "sign error" in msg.lower():
+                            self.logger.error(f"[SIGN ERROR] Sign error detected for ID {player_id}, code {giftcode}")
+                            self.logger.error(f"[SIGN ERROR] Response: {resp_json}")
+                            return "SIGN_ERROR", resp_json
+                        if msg == "STOVE_LV ERROR" and err_code == 40006:
+                            self.logger.error(f"[FURNACE LVL ERROR] Furnace level is too low for ID {player_id}, code {giftcode}")
+                            self.logger.error(f"[FURNACE LVL ERROR] Response: {resp_json}")
+                            return "TOO_SMALL_SPEND_MORE", resp_json
+                        if msg == "RECHARGE_MONEY ERROR" and err_code == 40017:
+                            self.logger.error(f"[VIP LEVEL ERROR] VIP level is too low for ID {player_id}, code {giftcode}")
+                            self.logger.error(f"[VIP LEVEL ERROR] Response: {resp_json}")
+                            return "TOO_POOR_SPEND_MORE", resp_json
+
+                        # If we get here, try again on certain transient statuses
+                        if resp.status in [500, 502, 503, 504]:
+                            last_resp_json = resp_json
+                            await asyncio.sleep(1 + attempt)
+                            continue
+
+                        # Unknown or unhandled
+                        self.logger.info(f"Unknown API response for {player_id}: msg='{msg}', err_code={err_code}")
+                        return "UNKNOWN_API_RESPONSE", resp_json
+
+            except Exception as e:
+                self.logger.debug(f"attempt_gift_code_with_api attempt {attempt} error: {e}")
+                await asyncio.sleep(min(2 ** attempt, 8))
+
+        # If all retries failed
+        return "ERROR", last_resp_json
 
     async def claim_giftcode_rewards_wos(self, player_id, giftcode):
 
@@ -890,35 +951,48 @@ class GiftOperations(commands.Cog):
                         self.logger.info(f"CACHE HIT - User {player_id} code '{giftcode}' status: {existing_record[0]}")
                         return existing_record[0]
 
-            # Get player session
-            session, response_stove_info = self.get_stove_info_wos(player_id=player_id)
+            # Acquire optional proxy from LoginHandler proxy pool
+            proxy = None
+            try:
+                from .login_handler import LoginHandler
+                lh = LoginHandler()
+                if getattr(lh, 'proxy_enabled', False) and getattr(lh, 'proxy_pool', None):
+                    proxy = await lh.proxy_pool.acquire()
+            except Exception:
+                proxy = None
+
+            # Get player session/info (async)
+            status_code, player_info = await self.get_stove_info_wos(player_id=player_id, proxy=proxy)
             log_entry_player = f"\n{datetime.now()} API REQUEST - Player Info\nPlayer ID: {player_id}\n"
             try:
-                response_json_player = response_stove_info.json()
-                log_entry_player += f"Response Code: {response_stove_info.status_code}\nResponse JSON:\n{json.dumps(response_json_player, indent=2)}\n"
-            except json.JSONDecodeError:
-                log_entry_player += f"Response Code: {response_stove_info.status_code}\nResponse Text (Not JSON): {response_stove_info.text[:500]}...\n"
+                if isinstance(player_info, dict):
+                    log_entry_player += f"Response Code: {status_code}\nResponse JSON:\n{json.dumps(player_info, indent=2)}\n"
+                else:
+                    log_entry_player += f"Response Code: {status_code}\nResponse Text (Not JSON): {str(player_info)[:500]}...\n"
+            except Exception:
+                pass
             log_entry_player += "-" * 50 + "\n"
-            self.giftlog.info(log_entry_player.strip())
-
             try:
-                player_info_json = response_stove_info.json()
-            except json.JSONDecodeError:
-                player_info_json = {}
+                self.giftlog.info(log_entry_player.strip())
+            except Exception:
+                pass
+
+            player_info_json = player_info if isinstance(player_info, dict) else {}
             login_successful = player_info_json.get("msg") == "success"
 
             if not login_successful:
                 status = "LOGIN_FAILED"
                 log_message = f"{datetime.now()} Login failed for ID {player_id}: {player_info_json.get('msg', 'Unknown')}\n"
-                self.giftlog.info(log_message.strip())
+                try:
+                    self.giftlog.info(log_message.strip())
+                except Exception:
+                    pass
                 return status
 
             # Try gift code redemption
             self.logger.info(f"GiftOps: Starting gift code redemption for ID {player_id}")
-            
-            status, _, _, _ = await self.attempt_gift_code_with_api(
-                player_id, giftcode, session
-            )
+            status_result, _ = await self.attempt_gift_code_with_api(player_id, giftcode, proxy=proxy)
+            status = status_result
 
             # Handle database updates for successful redemptions
             if player_id != self.get_test_fid() and status in ["SUCCESS", "RECEIVED", "SAME TYPE EXCHANGE"]:

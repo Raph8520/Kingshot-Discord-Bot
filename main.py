@@ -618,6 +618,8 @@ if __name__ == "__main__":
         for cog in cogs:
             try:
                 await bot.load_extension(f"cogs.{cog}")
+                print(f"COG loaded: {cog}")
+
             except Exception as e:
                 print(f"✗ Failed to load cog {cog}: {e}")
                 failed_cogs.append(cog)

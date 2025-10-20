@@ -67,6 +67,16 @@ class LoginHandler:
             self.proxy_pool = ProxyPool()
         except Exception:
             self.proxy_pool = None
+        # Print proxy summary to terminal at startup for visibility
+        try:
+            if self.proxy_pool and self.proxy_pool.size() > 0:
+                sample = self.proxy_pool.sample_proxies(5)
+                print(f"[LoginHandler] Proxy mode enabled: {self.proxy_enabled} | Pool size: {self.proxy_pool.size()}")
+                print(f"[LoginHandler] Proxy sample: {sample}")
+            else:
+                print(f"[LoginHandler] Proxy mode enabled: {self.proxy_enabled} | No proxies loaded")
+        except Exception:
+            pass
         
         # Mark as initialized
         self._initialized = True
@@ -204,6 +214,11 @@ class LoginHandler:
         try:
             # Use proxy if provided and main request fails
             if use_proxy:
+                # Trace proxy usage to terminal/log
+                try:
+                    print(f"[LoginHandler] Using proxy for ID {fid}: {use_proxy}")
+                except Exception:
+                    pass
                 from aiohttp_socks import ProxyConnector
                 connector = ProxyConnector.from_url(use_proxy, ssl=self.ssl_context)
             else:
@@ -319,6 +334,10 @@ class LoginHandler:
                     # Acquire a proxy if pool available
                     if self.proxy_pool:
                         proxy = await self.proxy_pool.acquire()
+                        try:
+                            print(f"[LoginHandler] Acquired proxy for worker {idx}: {proxy}")
+                        except Exception:
+                            pass
                 except Exception as e:
                     self.log_message(f"Proxy acquire failed: {e}")
                     proxy = None

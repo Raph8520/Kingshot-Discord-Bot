@@ -804,13 +804,52 @@ class Alliance(commands.Cog):
                 elif custom_id == "gift_code_operations":
                     try:
                         gift_ops_cog = interaction.client.get_cog("GiftOperations")
+                        if not gift_ops_cog:
+                            # Try to load the cog dynamically and retry
+                            try:
+                                print("[alliance] GiftOperations cog missing - attempting dynamic load...")
+                                await interaction.client.load_extension('cogs.gift_operations')
+                                gift_ops_cog = interaction.client.get_cog('GiftOperations')
+                                print("[alliance] Dynamic load of GiftOperations succeeded")
+                            except Exception as load_e:
+                                # Log load failure and inform user
+                                import traceback, os
+                                log_dir = os.path.join(os.getcwd(), 'log')
+                                try:
+                                    if not os.path.exists(log_dir):
+                                        os.makedirs(log_dir)
+                                except Exception:
+                                    pass
+                                log_path = os.path.join(log_dir, 'alliance_errors.txt')
+                                try:
+                                    with open(log_path, 'a', encoding='utf-8') as lf:
+                                        lf.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Failed to load GiftOperations: {load_e}\n")
+                                        lf.write(''.join(traceback.format_exception(type(load_e), load_e, load_e.__traceback__)))
+                                        lf.write('\n')
+                                except Exception:
+                                    print('Failed to write load error to alliance_errors.txt')
+                                print(f"[alliance] Failed to dynamically load GiftOperations: {load_e}")
+                                # Provide a short, sanitized error summary to the user while
+                                # keeping the full traceback in the log file.
+                                try:
+                                    short_msg = str(load_e).replace('\n', ' ')[:200]
+                                except Exception:
+                                    short_msg = 'load error'
+                                display_msg = f"❌ Gift Operations module unavailable (load error: {short_msg}). Check bot logs."
+                                if not interaction.response.is_done():
+                                    await interaction.response.send_message(
+                                        display_msg,
+                                        ephemeral=True
+                                    )
+                                else:
+                                    await interaction.followup.send(
+                                        display_msg,
+                                        ephemeral=True
+                                    )
+                                return
+
                         if gift_ops_cog:
                             await gift_ops_cog.show_gift_menu(interaction)
-                        else:
-                            await interaction.response.send_message(
-                                "❌ Gift Operations module not found.",
-                                ephemeral=True
-                            )
                     except Exception as e:
                         print(f"Gift operations error: {e}")
                         if not interaction.response.is_done():
@@ -869,13 +908,44 @@ class Alliance(commands.Cog):
                 elif custom_id == "alliance_history":
                     try:
                         changes_cog = interaction.client.get_cog("Changes")
+                        if not changes_cog:
+                            # Attempt to load the Changes cog dynamically
+                            try:
+                                print("[alliance] Changes cog missing - attempting dynamic load...")
+                                await interaction.client.load_extension('cogs.changes')
+                                changes_cog = interaction.client.get_cog('Changes')
+                                print("[alliance] Dynamic load of Changes succeeded")
+                            except Exception as load_e:
+                                import traceback, os
+                                log_dir = os.path.join(os.getcwd(), 'log')
+                                try:
+                                    if not os.path.exists(log_dir):
+                                        os.makedirs(log_dir)
+                                except Exception:
+                                    pass
+                                log_path = os.path.join(log_dir, 'alliance_errors.txt')
+                                try:
+                                    with open(log_path, 'a', encoding='utf-8') as lf:
+                                        lf.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Failed to load Changes: {load_e}\n")
+                                        lf.write(''.join(traceback.format_exception(type(load_e), load_e, load_e.__traceback__)))
+                                        lf.write('\n')
+                                except Exception:
+                                    print('Failed to write load error to alliance_errors.txt')
+                                print(f"[alliance] Failed to dynamically load Changes: {load_e}")
+                                if not interaction.response.is_done():
+                                    await interaction.response.send_message(
+                                        "❌ Alliance History module is unavailable and failed to load. Check bot logs.",
+                                        ephemeral=True
+                                    )
+                                else:
+                                    await interaction.followup.send(
+                                        "❌ Alliance History module is unavailable and failed to load. Check bot logs.",
+                                        ephemeral=True
+                                    )
+                                return
+
                         if changes_cog:
                             await changes_cog.show_alliance_history_menu(interaction)
-                        else:
-                            await interaction.response.send_message(
-                                "❌ Alliance History module not found.",
-                                ephemeral=True
-                            )
                     except Exception as e:
                         print(f"Alliance history error: {e}")
                         if not interaction.response.is_done():

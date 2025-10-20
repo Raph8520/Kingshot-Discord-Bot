@@ -91,6 +91,10 @@ class ProxyPool:
         self._load_proxies()
         self._sticky.clear()
 
+    def sample_proxies(self, limit: int = 5) -> List[str]:
+        """Return a small sample list of proxies (not removing them)."""
+        return [p for _, p in list(self._heap)[:limit]]
+
     def has_proxies(self) -> bool:
         return len(self._heap) > 0
 

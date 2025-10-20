@@ -1068,6 +1068,12 @@ class AllianceMemberOperations(commands.Cog):
         
         total_users = len(ids_list)
         self.log_message(f"Pre-check complete: {len(already_in_db)} already exist, {len(fids_to_process)} to process")
+        # Trace start in terminal
+        try:
+            print(f"[AllianceMemberOperations] Add users initiated by {interaction.user} ({interaction.user.id}) - Total: {total_users}, ToProcess: {len(fids_to_process)}, AlreadyExist: {len(already_in_db)}")
+            print(f"[AllianceMemberOperations] API Mode: {self.login_handler.get_mode_text()} | Proxies enabled: {self.login_handler.proxy_enabled}")
+        except Exception:
+            pass
         
         # For queued operations, we need to send a new progress embed
         if interaction.response.is_done():
@@ -1157,140 +1163,243 @@ class AllianceMemberOperations(commands.Cog):
                 )
                 await message.edit(embed=embed)
             
-            index = 0
-            while index < len(fids_to_process):
-                fid = fids_to_process[index]
-                try:
-                    # Update progress
-                    queue_info = f"\n📋 **Operations in queue:** {self.login_handler.get_queue_info()['queue_size']}" if self.login_handler.get_queue_info()['queue_size'] > 0 else ""
-                    current_progress = already_exists_count + index + 1
-                    embed.description = f"Processing {total_users} members...\n{rate_text}{queue_info}\n\n**Progress:** `{current_progress}/{total_users}`"
-                    await message.edit(embed=embed)
-                    
-                    # Fetch player data using login handler
-                    result = await self.login_handler.fetch_player_data(fid)
-                    
-                    with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                        log_file.write(f"\nAPI Response for ID {fid}:\n")
-                        log_file.write(f"Status: {result['status']}\n")
-                    
-                    if result['status'] == 'rate_limited':
-                        # Handle rate limiting with countdown
-                        wait_time = result.get('wait_time', 60)
-                        countdown_start = time.time()
-                        remaining_time = wait_time
-                        
-                        with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                            log_file.write(f"Rate limit reached - Total wait time: {wait_time:.1f} seconds\n")
-                        
-                        # Update display with countdown
-                        while remaining_time > 0:
-                            queue_info = f"\n📋 **Operations in queue:** {self.login_handler.get_queue_info()['queue_size']}" if self.login_handler.get_queue_info()['queue_size'] > 0 else ""
-                            embed.description = f"⚠️ Rate limit reached. Waiting {remaining_time:.0f} seconds...{queue_info}"
-                            embed.color = discord.Color.orange()
-                            await message.edit(embed=embed)
-                            
-                            # Wait for up to 5 seconds before updating
-                            await asyncio.sleep(min(5, remaining_time))
-                            elapsed = time.time() - countdown_start
-                            remaining_time = max(0, wait_time - elapsed)
-                        
-                        embed.color = discord.Color.blue()
-                        continue  # Retry this request
-                    
-                    if result['status'] == 'success':
-                        data = result['data']
-                        with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                            log_file.write(f"API Response Data: {str(data)}\n")
-                        
-                        nickname = data.get('nickname')
-                        furnace_lv = data.get('stove_lv', 0)
-                        stove_lv_content = data.get('stove_lv_content', None)
-                        kid = data.get('kid', None)
+            # Prefer batch fetch path (uses proxies/parallel when available). Fallback to sequential per-ID processing if batch fails.
+            if fids_to_process:
+                batch_results = None
 
-                        if nickname:
-                            try: # Since we pre-filtered, this ID should not exist in database
-                                self.c_users.execute("""
-                                    INSERT INTO users (fid, nickname, furnace_lv, kid, stove_lv_content, alliance)
-                                    VALUES (?, ?, ?, ?, ?, ?)
-                                """, (fid, nickname, furnace_lv, kid, stove_lv_content, alliance_id))
-                                self.conn_users.commit()
-                                
-                                with open(self.log_file, 'a', encoding='utf-8') as f:
-                                    f.write(f"[{timestamp}] Successfully added member - ID: {fid}, Nickname: {nickname}, Level: {furnace_lv}\n")
-                                
-                                added_count += 1
-                                added_users.append((fid, nickname))
-                                
-                                embed.set_field_at(
-                                    0,
-                                    name=f"✅ Successfully Added ({added_count}/{total_users})",
+                async def progress_cb(current, total, status_msg):
+                    try:
+                        queue_info = f"\n📋 **Operations in queue:** {self.login_handler.get_queue_info()['queue_size']}" if self.login_handler.get_queue_info()['queue_size'] > 0 else ""
+                        embed.description = f"Processing {total_users} members...\n{rate_text}{queue_info}\n\n**Progress:** `{already_exists_count + current}/{total_users}`"
+                        embed.set_field_at(
+                            0,
+                            name=f"✅ Successfully Added ({added_count}/{total_users})",
+                            value="User list cannot be displayed due to exceeding 70 users" if len(added_users) > 70 
+                            else ", ".join([n for _, n in added_users]) or "-",
+                            inline=False
+                        )
+                        embed.set_field_at(
+                            1,
+                            name=f"❌ Failed ({error_count}/{total_users})",
+                            value="Error list cannot be displayed due to exceeding 70 users" if len(error_users) > 70 
+                            else ", ".join(error_users) or "-",
+                            inline=False
+                        )
+                        embed.set_field_at(
+                            2,
+                            name=f"⚠️ Already Exists ({already_exists_count}/{total_users})",
+                            value="Existing user list cannot be displayed due to exceeding 70 users" if len(already_exists_users) > 70 
+                            else ", ".join([nickname for _, nickname in already_exists_users]) or "-",
+                            inline=False
+                        )
+                        try:
+                            await message.edit(embed=embed)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                # Try batch fetch (this may use proxies internally)
+                try:
+                    batch_results = await self.login_handler.fetch_player_batch(fids_to_process, progress_callback=progress_cb, alliance_id=alliance_id)
+                except Exception as e:
+                    # Batch path failed; log and fallback
+                    self.log_message(f"Batch fetch failed: {e}")
+                    batch_results = None
+
+                if batch_results and isinstance(batch_results, list) and len(batch_results) == len(fids_to_process):
+                    # Process batch results in order
+                    for idx, fid in enumerate(fids_to_process):
+                        result = batch_results[idx]
+                        try:
+                            # Trace per-ID result to terminal
+                            try:
+                                print(f"[AllianceMemberOperations] Batch result for {fid}: {result.get('status')}")
+                            except Exception:
+                                pass
+                            with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                                log_file.write(f"\nAPI Response for ID {fid}:\n")
+                                log_file.write(f"Status: {result.get('status')}\n")
+
+                            if result.get('status') == 'rate_limited':
+                                # treat as temporary; perform a small wait and one retry sequentially
+                                wait_time = result.get('wait_time', 10)
+                                self.log_message(f"Batch result rate-limited for {fid}, waiting {wait_time}s then retrying sequentially")
+                                await asyncio.sleep(wait_time)
+                                result = await self.login_handler.fetch_player_data(fid)
+
+                            if result.get('status') == 'success':
+                                data = result.get('data', {})
+                                nickname = data.get('nickname')
+                                furnace_lv = data.get('stove_lv', 0)
+                                stove_lv_content = data.get('stove_lv_content', None)
+                                kid = data.get('kid', None)
+
+                                if nickname:
+                                    try:
+                                        self.c_users.execute("""
+                                            INSERT INTO users (fid, nickname, furnace_lv, kid, stove_lv_content, alliance)
+                                            VALUES (?, ?, ?, ?, ?, ?)
+                                        """, (fid, nickname, furnace_lv, kid, stove_lv_content, alliance_id))
+                                        self.conn_users.commit()
+                                        added_count += 1
+                                        added_users.append((fid, nickname))
+                                    except sqlite3.IntegrityError:
+                                        already_exists_count += 1
+                                        already_exists_users.append((fid, nickname))
+                                    except Exception as e:
+                                        error_count += 1
+                                        error_users.append(fid)
+
+                            elif result.get('status') in ('not_found', 'error'):
+                                error_count += 1
+                                error_users.append(fid)
+                            else:
+                                # Unknown or unexpected status
+                                error_count += 1
+                                error_users.append(fid)
+
+                            # Update embed periodically
+                            try:
+                                embed.set_field_at(0, name=f"✅ Successfully Added ({added_count}/{total_users})",
                                     value="User list cannot be displayed due to exceeding 70 users" if len(added_users) > 70 
                                     else ", ".join([n for _, n in added_users]) or "-",
                                     inline=False
                                 )
-                                await message.edit(embed=embed)
-                                
-                            except sqlite3.IntegrityError as e:
-                                # This shouldn't happen since we pre-filtered, but handle it just in case
-                                with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                                    log_file.write(f"ERROR: Member already exists (race condition?) - ID {fid}: {str(e)}\n")
-                                already_exists_count += 1
-                                already_exists_users.append((fid, nickname))
-                                
-                                embed.set_field_at(
-                                    2,
-                                    name=f"⚠️ Already Exists ({already_exists_count}/{total_users})",
-                                    value="Existing user list cannot be displayed due to exceeding 70 users" if len(already_exists_users) > 70 
-                                    else ", ".join([n for _, n in already_exists_users]) or "-",
-                                    inline=False
-                                )
-                                await message.edit(embed=embed)
-                                
-                            except Exception as e:
-                                with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                                    log_file.write(f"ERROR: Database error for ID {fid}: {str(e)}\n")
-                                error_count += 1
-                                error_users.append(fid)
-                                
-                                embed.set_field_at(
-                                    1,
-                                    name=f"❌ Failed ({error_count}/{total_users})",
+                                embed.set_field_at(1, name=f"❌ Failed ({error_count}/{total_users})",
                                     value="Error list cannot be displayed due to exceeding 70 users" if len(error_users) > 70 
                                     else ", ".join(error_users) or "-",
                                     inline=False
                                 )
-                                await message.edit(embed=embed)
-                        else:
-                            # No nickname in API response
+                                embed.set_field_at(2, name=f"⚠️ Already Exists ({already_exists_count}/{total_users})",
+                                    value="Existing user list cannot be displayed due to exceeding 70 users" if len(already_exists_users) > 70 
+                                    else ", ".join([nickname for _, nickname in already_exists_users]) or "-",
+                                    inline=False
+                                )
+                                try:
+                                    await message.edit(embed=embed)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+
+                        except Exception as e:
+                            with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                                log_file.write(f"ERROR: Processing failed for ID {fid}: {str(e)}\n")
                             error_count += 1
                             error_users.append(fid)
-                    else:
-                            # Handle other error statuses
-                            error_msg = result.get('error_message', 'Unknown error')
-                            with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                                log_file.write(f"ERROR: {error_msg} for ID {fid}\n")
-                            error_count += 1
-                            if fid not in error_users:
-                                error_users.append(fid)
-                            embed.set_field_at(
-                                1,
-                                name=f"❌ Failed ({error_count}/{total_users})",
-                                value="Error list cannot be displayed due to exceeding 70 users" if len(error_users) > 70 
-                                else ", ".join(error_users) or "-",
-                                inline=False
-                            )
-                            await message.edit(embed=embed)
-                    
-                    index += 1
 
-                except Exception as e:
-                    with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                        log_file.write(f"ERROR: Request failed for ID {fid}: {str(e)}\n")
-                        error_count += 1
-                        error_users.append(fid)
-                        await message.edit(embed=embed)
-                        index += 1
+                    # Trace batch completion summary
+                    try:
+                        print(f"[AllianceMemberOperations] Batch processing complete - Added: {added_count}, Errors: {error_count}, AlreadyExists: {already_exists_count}")
+                    except Exception:
+                        pass
+
+                else:
+                    # Fallback sequential path (preserves original behavior)
+                    for fid in fids_to_process:
+                        try:
+                            # Trace sequential processing start for this fid
+                            try:
+                                print(f"[AllianceMemberOperations] Sequential processing for ID {fid}")
+                            except Exception:
+                                pass
+                            queue_info = f"\n📋 **Operations in queue:** {self.login_handler.get_queue_info()['queue_size']}" if self.login_handler.get_queue_info()['queue_size'] > 0 else ""
+                            current_progress = already_exists_count + len(added_users) + len(error_users) + 1
+                            embed.description = f"Processing {total_users} members...\n{rate_text}{queue_info}\n\n**Progress:** `{current_progress}/{total_users}`"
+                            await message.edit(embed=embed)
+
+                            result = await self.login_handler.fetch_player_data(fid)
+
+                            with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                                log_file.write(f"\nAPI Response for ID {fid}:\n")
+                                log_file.write(f"Status: {result['status']}\n")
+
+                            if result['status'] == 'rate_limited':
+                                wait_time = result.get('wait_time', 60)
+                                countdown_start = time.time()
+                                remaining_time = wait_time
+                                with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                                    log_file.write(f"Rate limit reached - Total wait time: {wait_time:.1f} seconds\n")
+
+                                while remaining_time > 0:
+                                    queue_info = f"\n📋 **Operations in queue:** {self.login_handler.get_queue_info()['queue_size']}" if self.login_handler.get_queue_info()['queue_size'] > 0 else ""
+                                    embed.description = f"⚠️ Rate limit reached. Waiting {remaining_time:.0f} seconds...{queue_info}"
+                                    embed.color = discord.Color.orange()
+                                    try:
+                                        await message.edit(embed=embed)
+                                    except Exception:
+                                        pass
+                                    await asyncio.sleep(min(5, remaining_time))
+                                    elapsed = time.time() - countdown_start
+                                    remaining_time = max(0, wait_time - elapsed)
+
+                                embed.color = discord.Color.blue()
+                                # retry once
+                                result = await self.login_handler.fetch_player_data(fid)
+
+                            if result['status'] == 'success':
+                                data = result['data']
+                                nickname = data.get('nickname')
+                                furnace_lv = data.get('stove_lv', 0)
+                                stove_lv_content = data.get('stove_lv_content', None)
+                                kid = data.get('kid', None)
+
+                                if nickname:
+                                    try:
+                                        self.c_users.execute("""
+                                            INSERT INTO users (fid, nickname, furnace_lv, kid, stove_lv_content, alliance)
+                                            VALUES (?, ?, ?, ?, ?, ?)
+                                        """, (fid, nickname, furnace_lv, kid, stove_lv_content, alliance_id))
+                                        self.conn_users.commit()
+                                        added_count += 1
+                                        added_users.append((fid, nickname))
+                                    except sqlite3.IntegrityError:
+                                        already_exists_count += 1
+                                        already_exists_users.append((fid, nickname))
+                                    except Exception as e:
+                                        error_count += 1
+                                        error_users.append(fid)
+                                else:
+                                    error_count += 1
+                                    error_users.append(fid)
+                            else:
+                                error_count += 1
+                                error_users.append(fid)
+
+                            try:
+                                embed.set_field_at(0, name=f"✅ Successfully Added ({added_count}/{total_users})",
+                                    value="User list cannot be displayed due to exceeding 70 users" if len(added_users) > 70 
+                                    else ", ".join([n for _, n in added_users]) or "-",
+                                    inline=False
+                                )
+                                embed.set_field_at(1, name=f"❌ Failed ({error_count}/{total_users})",
+                                    value="Error list cannot be displayed due to exceeding 70 users" if len(error_users) > 70 
+                                    else ", ".join(error_users) or "-",
+                                    inline=False
+                                )
+                                embed.set_field_at(2, name=f"⚠️ Already Exists ({already_exists_count}/{total_users})",
+                                    value="Existing user list cannot be displayed due to exceeding 70 users" if len(already_exists_users) > 70 
+                                    else ", ".join([nickname for _, nickname in already_exists_users]) or "-",
+                                    inline=False
+                                )
+                                try:
+                                    await message.edit(embed=embed)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+
+                        except Exception as e:
+                            with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                                log_file.write(f"ERROR: Request failed for ID {fid}: {str(e)}\n")
+                            error_count += 1
+                            error_users.append(fid)
+                            try:
+                                print(f"[AllianceMemberOperations] Error during sequential processing for {fid}: {e}")
+                            except Exception:
+                                pass
+
 
             embed.set_field_at(0, name=f"✅ Successfully Added ({added_count}/{total_users})",
                 value="User list cannot be displayed due to exceeding 70 users" if len(added_users) > 70 
@@ -1360,6 +1469,12 @@ class AllianceMemberOperations(commands.Cog):
                 log_file.write(f"API Mode: {self.login_handler.get_mode_text()}\n")
                 log_file.write(f"API Requests: {len(self.login_handler.api_requests)}\n")
                 log_file.write(f"{'='*50}\n")
+
+            # Print final summary to terminal
+            try:
+                print(f"[AllianceMemberOperations] Completed add operation - Added: {added_count}, Failed: {error_count}, AlreadyExists: {already_exists_count}, Total: {total_users}")
+            except Exception:
+                pass
 
         except Exception as e:
             with open(log_file_path, 'a', encoding='utf-8') as log_file:
